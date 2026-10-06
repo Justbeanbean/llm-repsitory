@@ -1,0 +1,164 @@
+# Agent LLM Gateway 配置
+# 环境变量替换：${VAR} / ${VAR:-default}（bash 风格；仅匹配大写名，
+# 模板内小写占位符如 ${product_name} 不受影响）
+
+service_name: unified-llm-gateway
+
+# 留空表示开发模式不校验调用方；生产环境请设置 GATEWAY_API_KEY。
+api_keys:
+  - ${GATEWAY_API_KEY:-}
+
+database_url: data/gateway.db
+structured_output_retries: 1
+
+retry:
+  max_attempts_per_route: 2
+  base_delay_seconds: 0.25
+  max_delay_seconds: 4
+  retry_statuses: [408, 409, 429, 500, 502, 503, 504]
+
+circuit_breaker:
+  failure_threshold: 5
+  cooldown_seconds: 30
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst: 10
+
+# 默认关闭，避免在未评估隐私策略前保存模型正文。
+stream_checkpoint:
+  enabled: false
+  flush_interval_seconds: 1
+  max_chars: 200000
+
+providers:
+  openai:
+    base_url: https://api.openai.com
+    api_key: ${OPENAI_API_KEY:-}
+    timeout_seconds: 120
+  deepseek:
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    timeout_seconds: 120
+  local:
+    base_url: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:11434}
+    api_key: ${LOCAL_LLM_API_KEY:-ollama}
+    enabled: false
+
+# 公开模型别名 → 路由（provider + 供应商真实模型名）
+# strategy: priority | weighted_round_robin
+# api: both = chat + /v1/responses；chat = 仅 /v1/chat/completions
+# structured_output_mode: json_schema | json_object（按供应商能力）
+# stream_usage: false 可对该 route 关闭流式 usage 回传（不兼容 stream_options 的端点）
+models:
+  smart:
+    strategy: priority
+    routes:
+      - provider: openai
+        model: gpt-5.2
+        api: both
+      - provider: deepseek
+        model: deepseek-chat
+        api: both
+        structured_output_mode: json_object
+  fast:
+    strategy: weighted_round_robin
+    routes:
+      - provider: deepseek
+        model: deepseek-v4-flash
+        weight: 3
+        api: both
+        structured_output_mode: json_object
+      - provider: deepseek
+        model: deepseek-chat
+        weight: 1
+        api: chat
+        structured_output_mode: json_object
+  local-chat:
+    strategy: priority
+    routes:
+      - provider: local
+        model: qwen3:8b
+        api: chat
+
+# 单位：美元 / 1M tokens。请按供应商当前价格自行维护。
+# pricing_version：价格版本（进 Trace，成本审计可对比调价前后口径）
+pricing_version: v1
+pricing:
+  gpt-5.2:
+    input_per_million: 1.75
+    output_per_million: 14
+    cached_input_per_million: 0.175
+  gpt-5-mini:
+    input_per_million: 0.25
+    output_per_million: 2
+    cached_input_per_million: 0.025
+  deepseek-chat:
+    input_per_million: 0.28
+    output_per_million: 0.42
+  deepseek-v4-flash:
+    input_per_million: 0.14
+    output_per_million: 0.28
+
+# ── 以下为本 Gateway 的可选扩展段（缺省均有默认值）─────────────────────
+
+governance:                     # 资源治理
+  run_budget_seconds: 120       # Run 预算：重试/Fallback/修复共用同一 deadline（耗尽 504）
+  max_concurrency_per_candidate: 8   # 每供应商候选并发上限（超限排队而非拒绝）
+  max_caller_concurrency: 4     # 每调用方并发上限（超限 429）
+
+security:                       # base_url 白名单（受配置控制的出站边界）
+  allowed_base_url_schemes: [http, https]
+  # allowed_base_url_hosts: [api.deepseek.com, api.openai.com]   # 需要时启用主机白名单
+
+log_level: INFO
+
+# CORS：默认关闭（服务端 Agent 直连无需）；浏览器端 Agent 按需放开
+# cors:
+#   allow_origins: ["https://your-agent-app.example.com"]
+
+# Prompt Bundle：沙箱模板 + 输入/输出 Schema + 业务规则 + 模型与参数默认值
+prompt_templates:
+  - name: task_plan
+    version: v1                 # 稳定版
+    system_template: "你是${product_name}的任务规划器。把用户目标拆解为可执行的步骤列表。不得编造工具。"
+    input_schema:
+      type: object
+      properties:
+        product_name: { type: string, minLength: 1 }
+      required: [product_name]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        goal: { type: string }
+        steps: { type: array, items: { type: string } }
+        completion_criteria: { type: array, items: { type: string } }
+        requires_tools: { type: boolean }
+      required: [goal, steps, completion_criteria, requires_tools]
+      additionalProperties: false
+    business_model: task_plan   # 本地业务规则（pydantic）：JSON 合法 ≠ 业务合法
+    default_model: fast
+    default_timeout_seconds: 30
+  - name: task_plan
+    version: v2                 # 候选版：更严格的规划指令（内容 hash 与 v1 不同）
+    system_template: "你是${product_name}的任务规划器。把用户目标拆解为不超过 5 步的可执行计划，每步必须有完成判据。不得编造工具。"
+    input_schema:
+      type: object
+      properties:
+        product_name: { type: string, minLength: 1 }
+      required: [product_name]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        goal: { type: string }
+        steps: { type: array, items: { type: string } }
+        completion_criteria: { type: array, items: { type: string } }
+        requires_tools: { type: boolean }
+      required: [goal, steps, completion_criteria, requires_tools]
+      additionalProperties: false
+    business_model: task_plan
+    default_model: fast
+    default_timeout_seconds: 30

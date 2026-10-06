@@ -1,0 +1,16 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-demo-key-please-change}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?需要设置 DEEPSEEK_API_KEY}
+      DEEPSEEK_BACKUP_API_KEY: ${DEEPSEEK_BACKUP_API_KEY:?需要设置 DEEPSEEK_BACKUP_API_KEY}
+      PRIMARY_BASE_URL: ${PRIMARY_BASE_URL:-https://api.deepseek.com}
+    volumes:
+      - gateway-data:/app/data     # SQLite 用量账本持久化
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
